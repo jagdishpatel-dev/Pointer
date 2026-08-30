@@ -20,6 +20,16 @@ interface PollResponse {
   progress: JobProgress[];
 }
 
+interface CachedInvestigation {
+  jobId: string;
+  progress: JobProgress[];
+  verdict: FinalVerdict;
+  // Raw snapshot of sessionStorage['pr-doctor:pr-context'] at the time this
+  // investigation was cached. Used to detect "a new PR context has since
+  // been set" without deleting the cache on every render.
+  prContextRaw: string | null;
+}
+
 const AGENT_META: Record<AgentId, { displayName: string; mode: string }> = {
   'code-analyst':      { displayName: 'Code Analyst',                mode: 'Code' },
   'test-security':     { displayName: 'Test & Security',             mode: 'Advanced' },
@@ -122,7 +132,16 @@ function GraphifyPanel() {
   const [ctx, setCtx] = useState<GraphifyContext | null>(null);
 
   useEffect(() => {
-    fetch('/api/graphify').then(r => r.json()).then(setCtx).catch(() => {});
+    let cancelled = false;
+    fetch('/api/graphify')
+      .then(r => r.json())
+      .then(data => {
+        if (!cancelled) setCtx(data);
+      })
+      .catch(() => { /* ignore — panel just won't render */ });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   if (!ctx) return null;
@@ -242,16 +261,18 @@ function RiskGraph({ br }: { br: BlastRadius }) {
     nodePos[n.path] = { x: COL1_X, y: d1StartY + i * ROW_SPACING };
   });
 
-  // d2 nodes: each sits beside its d1 parent via edges
-  const d2Placed = new Set<string>();
+  // d2 nodes: each sits beside its d1 parent via edges. Stack siblings of the
+  // SAME parent below one another — the offset counter must be per-parent,
+  // not global, or every distance-2 node past the first collapses onto the
+  // same Y coordinate regardless of which parent it belongs to.
+  const d2SiblingIndex: Record<string, number> = {};
   d2.forEach(n => {
-    // find parent: a d1 node that has an edge to this node
     const parentEdge = br.edges.find(e => e.to === n.path && nodePos[e.from] && nodePos[e.from].x === COL1_X);
+    const parentKey = parentEdge?.from ?? '__unparented__';
     const parentY = parentEdge ? nodePos[parentEdge.from].y : d1StartY;
-    if (!d2Placed.has(n.path)) {
-      nodePos[n.path] = { x: COL2_X, y: parentY + (d2Placed.size > 0 ? ROW_SPACING * 0.6 : 0) };
-      d2Placed.add(n.path);
-    }
+    const siblingIdx = d2SiblingIndex[parentKey] ?? 0;
+    nodePos[n.path] = { x: COL2_X, y: parentY + siblingIdx * ROW_SPACING * 0.6 };
+    d2SiblingIndex[parentKey] = siblingIdx + 1;
   });
 
   // Caption values
@@ -373,30 +394,75 @@ function RiskGraph({ br }: { br: BlastRadius }) {
 }
 
 const SESSION_KEY = 'pr-doctor:investigation';
+const PR_CONTEXT_KEY = 'pr-doctor:pr-context';
 
-export default function InvestigationPage() {
-  // If a fresh PR context is waiting, wipe the stale investigation cache first
-  // so we never accidentally show a previous run's verdict.
-  if (typeof window !== 'undefined') {
-    try {
-      if (sessionStorage.getItem('pr-doctor:pr-context')) {
-        sessionStorage.removeItem(SESSION_KEY);
-      }
-    } catch { /* ignore */ }
+/**
+ * Reads sessionStorage exactly once (called from a lazy useState initializer,
+ * so it never re-runs on re-render and never runs as a render-time side
+ * effect). Returns the current raw pr-context string plus a validated cached
+ * investigation, if any — invalidating the cache only when the pr-context has
+ * genuinely changed since it was cached, not merely because it exists.
+ */
+function readInitialState(): { prContextRaw: string | null; cached: CachedInvestigation | null } {
+  if (typeof window === 'undefined') {
+    return { prContextRaw: null, cached: null };
   }
 
-  // Restore from sessionStorage on mount so back-navigation doesn't restart
-  const cached = typeof window !== 'undefined'
-    ? (() => { try { return JSON.parse(sessionStorage.getItem(SESSION_KEY) ?? 'null'); } catch { return null; } })()
-    : null;
+  const prContextRaw = sessionStorage.getItem(PR_CONTEXT_KEY);
+
+  let cached: CachedInvestigation | null = null;
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as CachedInvestigation;
+      // Only trust the cache if it was written for the same pr-context that's
+      // currently staged. If a new PR context has been set since, the cached
+      // investigation belongs to a different PR and must be discarded.
+      if (parsed.prContextRaw === prContextRaw) {
+        cached = parsed;
+      } else {
+        sessionStorage.removeItem(SESSION_KEY);
+      }
+    }
+  } catch {
+    // Corrupted cache — ignore it, don't crash the page.
+    try { sessionStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
+  }
+
+  return { prContextRaw, cached };
+}
+
+export default function InvestigationPage() {
+  // Computed once, on mount, via lazy initializer — not on every render.
+  const initialRef = useRef<{ prContextRaw: string | null; cached: CachedInvestigation | null } | null>(null);
+  if (initialRef.current === null) {
+    initialRef.current = readInitialState();
+  }
+  const { prContextRaw: initialPrContextRaw, cached } = initialRef.current;
+
+  const [prContext, setPrContext] = useState<PRContext | null>(() => {
+    if (!initialPrContextRaw) return null;
+    try {
+      return JSON.parse(initialPrContextRaw) as PRContext;
+    } catch {
+      return null;
+    }
+  });
 
   const [jobId, setJobId] = useState<string | null>(cached?.jobId ?? null);
   const [progress, setProgress] = useState<JobProgress[]>(cached?.progress ?? []);
   const [verdict, setVerdict] = useState<FinalVerdict | null>(cached?.verdict ?? null);
   const [error, setError] = useState<string | null>(null);
-const [prContext, setPrContext] = useState<PRContext | null>(null);  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Tracks which agent indexes are animating (running state)
+  // Guards against React 18 StrictMode's dev-only double-invoke of effects.
+  // A `cancelled` flag in the effect closure only stops the *state update*
+  // after the fact — it does not stop the fetch() from firing a second time
+  // and creating a second job server-side. This ref persists across the
+  // mount → cleanup → mount replay (same component instance), so only the
+  // very first invocation is ever allowed to call start().
+  const hasStartedAnalysisRef = useRef(false);
+
   const allComplete = cached?.verdict != null;
   const [barWidths, setBarWidths] = useState<Record<AgentId, number>>({
     'code-analyst': allComplete ? 100 : 0,
@@ -404,24 +470,7 @@ const [prContext, setPrContext] = useState<PRContext | null>(null);  const [anal
     'docs-compliance': allComplete ? 100 : 0,
     'orchestrator': allComplete ? 100 : 0,
   });
-useEffect(() => {
-  const raw = sessionStorage.getItem('pr-doctor:pr-context');
 
-  if (!raw) {
-    console.error('❌ NO PR CONTEXT IN SESSION STORAGE');
-    return;
-  }
-
-  try {
-    const context = JSON.parse(raw) as PRContext;
-
-    console.log('🔥 PR CONTEXT FOR UI:', context);
-
-    setPrContext(context);
-  } catch (error) {
-    console.error('❌ Failed to parse PR context:', error);
-  }
-}, []);
   // Animate running bars
   useEffect(() => {
     const tick = setInterval(() => {
@@ -440,94 +489,81 @@ useEffect(() => {
     return () => clearInterval(tick);
   }, [progress]);
 
-  // Start analysis on mount — skip if we already have a completed verdict cached
-useEffect(() => {
-  if (cached?.verdict) return;
+  // Start analysis on mount — skip if we already have a valid cached verdict.
+  useEffect(() => {
+    if (cached?.verdict) return;
 
-  let cancelled = false;
+    if (!prContext) {
+      setError('No PR context found. Go back and start a new investigation.');
+      return;
+    }
 
-  async function start() {
-    try {
-      const raw = sessionStorage.getItem('pr-doctor:pr-context');
+    // Block the replayed invocation from StrictMode's dev double-mount.
+    // Without this, both invocations pass the checks above and both call
+    // start(), posting to /api/analyze twice and creating two jobs.
+    if (hasStartedAnalysisRef.current) return;
+    hasStartedAnalysisRef.current = true;
 
-      let context: PRContext | null = null;
+    async function start() {
+      try {
+        const res = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prContext }),
+        });
 
-      if (raw) {
-        context = JSON.parse(raw) as PRContext;
-      } else {
-        console.error('❌ NO PR CONTEXT IN SESSION STORAGE');
-      }
+        if (!res.ok) {
+          throw new Error(`Failed to start analysis: ${res.status}`);
+        }
 
-      console.log('🔥 SENDING TO /api/analyze:', {
-        prContext: context,
-      });
-
-      const res = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          prContext: context,
-        }),
-      });
-
-      if (!res.ok) {
-        throw new Error(`Failed to start analysis: ${res.status}`);
-      }
-
-      const data = await res.json();
-
-      console.log('🔥 ANALYZE RESPONSE:', data);
-
-      if (cancelled) return;
-
-      setJobId(data.jobId);
-    } catch (e) {
-      console.error('❌ ANALYSIS START ERROR:', e);
-
-      if (!cancelled) {
-        setError(
-          e instanceof Error
-            ? e.message
-            : 'Unknown error'
-        );
+        const data = await res.json();
+        setJobId(data.jobId);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Unknown error starting analysis');
+        // Allow a retry (e.g. user navigates back and returns) since this
+        // attempt failed before ever getting a jobId.
+        hasStartedAnalysisRef.current = false;
       }
     }
-  }
 
-  start();
+    start();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  return () => {
-    cancelled = true;
-  };
-}, [cached?.verdict]);
-
-  // Poll once we have a jobId — skip if verdict already cached
+  // Poll once we have a jobId — skip if verdict already cached.
   useEffect(() => {
-    if (!jobId || cached?.verdict) return;
+    if (!jobId || verdict) return;
+    const currentJobId = jobId;
+
     async function poll() {
       try {
-        const res = await fetch(`/api/job/${jobId}`);
+        const res = await fetch(`/api/job/${encodeURIComponent(currentJobId)}`);
         if (!res.ok) return;
         const data: PollResponse = await res.json();
         setProgress(data.progress);
         setAnalysisError(data.analysisError);
 
-        // Real analysis finished (complete or failed with fixture fallback)
         if (data.complete) {
           if (intervalRef.current) clearInterval(intervalRef.current);
           intervalRef.current = null;
 
-          const vRes = await fetch(`/api/verdict/${jobId}`);
-          // 202 means still running — should not happen given complete:true, but guard anyway
+          const vRes = await fetch(`/api/verdict/${currentJobId}`);
           if (!vRes.ok) return;
-          console.log("ve",vRes)
           const v: FinalVerdict = await vRes.json();
           setVerdict(v);
-          // Persist so back-navigation restores the completed state
+
+          // Persist so back-navigation restores the completed state — tagged
+          // with the pr-context it was computed from, so a later, different
+          // pr-context correctly invalidates this cache instead of the cache
+          // invalidating itself on the next render.
           try {
-            sessionStorage.setItem(SESSION_KEY, JSON.stringify({ jobId, progress: data.progress, verdict: v }));
+            const cachePayload: CachedInvestigation = {
+              jobId: currentJobId,
+              progress: data.progress,
+              verdict: v,
+              prContextRaw: initialPrContextRaw,
+            };
+            sessionStorage.setItem(SESSION_KEY, JSON.stringify(cachePayload));
           } catch { /* storage full — ignore */ }
         }
       } catch {
@@ -541,23 +577,17 @@ useEffect(() => {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [jobId]);
+  }, [jobId, verdict, initialPrContextRaw]);
 
-  // Findings visible so far: only from agents that are complete
-  const visibleFindings: Finding[] = verdict
-    ? allFindings(verdict)
-    : [];
-
-  // If no verdict yet, show partial findings from complete agents based on progress
-  const completeAgents = new Set(progress.filter(p => p.status === 'complete').map(p => p.agent));
-
+  const visibleFindings: Finding[] = verdict ? allFindings(verdict) : [];
+  const isRunning = !verdict && !error && progress.length > 0;
   const decisionColor = verdict ? (DECISION_COLOR[verdict.decision] ?? '#14181C') : '#14181C';
 
   return (
     <div style={{ background: '#E9ECEF', minHeight: '100vh', fontFamily: '"IBM Plex Sans", system-ui, sans-serif', color: '#14181C', padding: '28px 20px 80px' }}>
       <div style={{ maxWidth: 1060, margin: '0 auto' }}>
 
-        {/* Analysis mode chip — shown always but changes appearance based on simulated flag */}
+        {/* Analysis mode chip */}
         <div style={{
           display: 'inline-flex',
           alignItems: 'center',
@@ -665,7 +695,6 @@ useEffect(() => {
               const status: AgentStatus = prog?.status ?? 'pending';
               const width = barWidths[agentId] ?? 0;
 
-              // Finding count from verdict if available, else from progress
               const findingCount = verdict
                 ? verdict.reports.find(r => r.agent === agentId)?.findings.length ?? 0
                 : 0;
@@ -705,7 +734,7 @@ useEffect(() => {
               );
             })}
 
-            {/* Orchestrator row — only shows after verdict */}
+            {/* Orchestrator row */}
             {(() => {
               const orchMeta = AGENT_META['orchestrator'];
               const orchProg = progress.find(p => p.agent === 'orchestrator');
@@ -740,11 +769,15 @@ useEffect(() => {
             })()}
           </div>
 
-          {/* Findings */}
-          {(visibleFindings.length > 0 || completeAgents.size > 0) && (
+          {/* Findings — only ever populated once the full verdict lands; the
+              backend has no per-agent findings endpoint, so we don't pretend
+              to show a progressive reveal that doesn't exist. */}
+          {(verdict || isRunning) && (
             <div style={{ padding: '20px 26px' }}>
               <div style={{ fontFamily: '"IBM Plex Mono", monospace', fontSize: 11, fontWeight: 600, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#68757F', marginBottom: 4 }}>
-                Findings{visibleFindings.length > 0 ? ` — ${visibleFindings.length} total, highest severity first` : ' — running…'}
+                {verdict
+                  ? `Findings — ${visibleFindings.length} total, highest severity first`
+                  : 'Findings — investigating…'}
               </div>
               {visibleFindings.map((f, i) => {
                 const agentLabel = verdict?.reports.find(r => r.findings.some(ff => ff.id === f.id))?.displayName ?? f.agent;
@@ -754,9 +787,9 @@ useEffect(() => {
                   </div>
                 );
               })}
-              {!verdict && completeAgents.size > 0 && (
+              {!verdict && (
                 <div style={{ fontFamily: '"IBM Plex Mono", monospace', fontSize: 12, color: '#68757F', padding: '10px 0' }}>
-                  Waiting for remaining agents…
+                  Findings will appear once every specialist and the orchestrator have finished.
                 </div>
               )}
             </div>

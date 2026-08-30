@@ -54,11 +54,11 @@ uv sync
 echo "GITHUB_TOKEN=ghp_yourtoken" >> .env
 echo "GITHUB_REPO=owner/repo"     >> .env
 
-# Ingest a PR and see its risk report
-.venv/bin/python -m integration.cli ingest 42
-python -m integration.cli ingest {pr-number}
+# Ingest PR #42 and print its risk report
+uv run python -m integration.cli ingest 42
+
 # Start the REST API server
-.venv/bin/python -m integration.cli serve
+uv run python -m integration.cli serve
 # → http://localhost:8000/docs
 ```
 
@@ -105,6 +105,129 @@ directly.
 | `dependency_change` | MEDIUM | A dependency manifest was touched |
 | `test_deletion` | MEDIUM | A test file was deleted |
 | `no_tests` | LOW | Source files changed but no test files in the diff |
+
+---
+
+## Running the Project
+
+The project has two runnable components that can be started independently.
+
+### Prerequisites
+
+| Tool | Version | Purpose |
+|---|---|---|
+| Python | ≥ 3.13 | Integration service |
+| [uv](https://docs.astral.sh/uv/) | any recent | Python package manager |
+| Node.js | ≥ 18 | PR Doctor frontend |
+| npm | ≥ 9 | Frontend dependency management |
+
+---
+
+### 1 — Integration service (Python backend)
+
+```bash
+cd apps/integration
+```
+
+**Install dependencies**
+
+```bash
+uv sync
+```
+
+**Create `.env`**
+
+```bash
+cp .env.example .env  # if it exists, otherwise create it manually
+```
+
+Add the following to `apps/integration/.env`:
+
+```dotenv
+GITHUB_TOKEN=ghp_yourPersonalAccessToken   # required — repo read scope
+GITHUB_REPO=owner/repo                     # required — e.g. octocat/Hello-World
+# optional overrides
+API_HOST=localhost
+API_PORT=8000
+DB_PATH=./data/pr_doctor.json
+```
+
+**Run the CLI**
+
+```bash
+# Ingest a single PR by number
+uv run python -m integration.cli ingest 42
+
+# Ingest all open PRs (default limit: 20)
+uv run python -m integration.cli ingest-open
+
+# List stored PRs (optionally filtered by risk level)
+uv run python -m integration.cli list --risk high
+
+# Print a stored PR as JSON
+uv run python -m integration.cli show 42
+```
+
+Alternatively, if `uv` added the script entry-point to PATH after `uv sync`:
+
+```bash
+pr-doctor ingest 42
+```
+
+**Start the REST API server**
+
+```bash
+uv run python -m integration.cli serve
+```
+
+The API is now live at `http://localhost:8000`. Interactive Swagger docs are at
+`http://localhost:8000/docs`.
+
+---
+
+### 2 — PR Doctor frontend (Next.js)
+
+```bash
+cd pr-doctor
+```
+
+**Install dependencies**
+
+```bash
+npm install
+```
+
+**Run the development server**
+
+```bash
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+**Other frontend commands**
+
+```bash
+npm run build   # production build
+npm run start   # serve the production build locally
+npm run lint    # run ESLint
+```
+
+---
+
+### Running both together
+
+Open two terminal windows:
+
+```bash
+# Terminal 1 — backend
+cd apps/integration && uv run python -m integration.cli serve
+
+# Terminal 2 — frontend
+cd pr-doctor && npm run dev
+```
+
+The frontend at `http://localhost:3000` expects the backend at `http://localhost:8000`.
 
 ---
 

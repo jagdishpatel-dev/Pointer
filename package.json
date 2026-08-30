@@ -1,0 +1,26 @@
+{
+  "name": "pointer-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PR Doctor — IBM BOB 2.0 hackathon monorepo",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter pr-doctor dev",
+    "build": "pnpm --filter pr-doctor build",
+    "start": "pnpm --filter pr-doctor start",
+    "lint": "pnpm --filter pr-doctor lint",
+    "validate": "pnpm --filter pr-doctor validate",
+    "install:web": "pnpm --filter pr-doctor install",
+    "install:python": "cd packages/pr-ingestion && uv sync",
+    "setup": "pnpm install && cd packages/pr-ingestion && uv sync",
+    "api:serve": "cd packages/pr-ingestion && uv run python -m integration.cli serve",
+    "api:ingest": "cd packages/pr-ingestion && uv run python -m integration.cli ingest"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.0.0",
+      "onFail": "download"
+    }
+  }
+}

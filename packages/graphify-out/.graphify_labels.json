@@ -1,0 +1,15 @@
+{
+  "0": "Integration Service Documentation",
+  "1": "PR Ingestion Pipeline",
+  "2": "CLI Command Layer",
+  "3": "Settings and Storage",
+  "4": "FastAPI REST Endpoints",
+  "5": "PRRecord Data Models",
+  "6": "PR Doctor Agent Subagents",
+  "7": "API Ingest Endpoints",
+  "8": "API Delete Endpoint",
+  "9": "Settings Configuration",
+  "10": "Integration Package Init",
+  "11": "Security and Credential Safety",
+  "12": "Package Metadata"
+}
